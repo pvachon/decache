@@ -52,6 +52,27 @@ void _dump_dir(struct dyld_cache_header *hdr, const void *cache, size_t cache_le
     }
 }
 
+static
+int _append_to_file(int fd, const void *buf, size_t len, off_t *poffset)
+{
+    int ret = -1;
+
+    /* Seek to the end of the file, and get the actual offset in bytes */
+    if (0 > (*poffset = lseek(fd, 0, SEEK_END))) {
+        fprintf(stderr, "Failure while preparing to append segment data, aborting.\n");
+        goto done;
+    }
+
+    if (len != 0 && (0 > write(fd, buf, len))) {
+        fprintf(stderr, "Failed to write %zu bytes to the output file, aborting.\n", len);
+        goto done;
+    }
+
+    ret = 0;
+done:
+    return ret;
+}
+
 /**
  * Perform fixups on the Mach-O object to rebase to 0 (for the new file we're writing out)
  */
@@ -65,6 +86,7 @@ int _fixup_macho_object64(int fd, const void *cache, size_t cache_len, void *mac
     size_t next_cmd = 0,
            file_base = 0,
            linkedit_file_base = 0;
+    off_t linkedit_end = 0;
 
     /* Prepare fixups for the header */
     while (next_cmd < hdr->sizeofcmds) {
@@ -83,7 +105,13 @@ int _fixup_macho_object64(int fd, const void *cache, size_t cache_len, void *mac
             if (!strncmp(seg->segname, SEG_LINKEDIT, 10)) {
                 DEBUG("            NOTE: this is the _LINKEDIT section, holding on for later use");
                 linkedit = seg;
-                linkedit_file_base = seg->fileoff;
+                linkedit->fileoff = file_base;
+                linkedit->filesize = 0;
+                /* Skip writing out the LINKEDIT section, we'll reconstruct it as we need to */
+
+                next_cmd += cmd->cmdsize;
+                cmd = macho_hdr + sizeof(struct mach_header_64) + next_cmd;
+                continue;
             }
 
             for (size_t i = 0; i < seg->nsects; i++) {
@@ -110,12 +138,52 @@ int _fixup_macho_object64(int fd, const void *cache, size_t cache_len, void *mac
         } else if (cmd->cmd == LC_SYMTAB) {
             struct symtab_command *symtab = (struct symtab_command *)cmd;
             off_t file_off = -1;
+            const struct nlist_64 *sym = cache + symtab->symoff;
+            struct nlist_64 *new_syms = NULL;
+            size_t strtab_len = 0;
+            const char *strtab = cache + symtab->stroff;
+
             DEBUG("    LC_SYMTAB: nsyms = %u symoff = %08x stroff = %08x, strsize = %u",
                     symtab->nsyms, symtab->symoff, symtab->stroff, symtab->strsize);
 
-            /* TODO: Fixup the symoff and stroff to point into the new _LINKEDIT */
-            symtab->symoff = symtab->symoff - linkedit_file_base + linkedit->fileoff;
-            symtab->stroff = symtab->stroff - linkedit_file_base + linkedit->fileoff;
+            if (NULL == (new_syms = malloc(symtab->nsyms * sizeof(struct nlist_64)))) {
+                fprintf(stderr, "Out of memory; could not allocate memory for %u symbols\n",
+                        symtab->nsyms);
+                goto done;
+            }
+
+            memcpy(new_syms, sym, symtab->nsyms * sizeof(struct nlist_64));
+
+            if (0 > (file_off = lseek(fd, 0, SEEK_CUR))) {
+                fprintf(stderr, "Error while getting current file position, aborting.\n");
+                goto done;
+            }
+
+            symtab->stroff = file_off;
+
+            /* Reconstruct the string table, from the symbol table */
+            for (size_t i = 0; i < symtab->nsyms; i++) {
+                const char *str = &strtab[sym[i].n_un.n_strx];
+                size_t str_len = strlen(str) + 1;
+
+                DEBUG("Symbol: 0x%016lx [%s] (%zu bytes)", sym[i].n_value, str, str_len);
+
+                if (0 > _append_to_file(fd, str, str_len, &file_off)) {
+                    fprintf(stderr, "Failed to append symbol table string table, aborting.\n");
+                    goto done;
+                }
+                new_syms[i].n_un.n_strx = file_off - symtab->stroff;
+                strtab_len += str_len;
+            }
+
+            symtab->strsize = strtab_len;
+
+            /* Write out our updated symbol table */
+            if (0 > _append_to_file(fd, new_syms, symtab->nsyms * sizeof(struct nlist_64), &file_off)) {
+                fprintf(stderr, "Failed to append symbol table, aborting.\n");
+                goto done;
+            }
+            symtab->symoff = file_off;
 
             DEBUG("    LC_SYMTAB (after): nsyms = %u symoff = %08x stroff = %08x, strsize = %u",
                     symtab->nsyms, symtab->symoff, symtab->stroff, symtab->strsize);
@@ -128,6 +196,16 @@ int _fixup_macho_object64(int fd, const void *cache, size_t cache_len, void *mac
                     dst->tocoff, dst->modtaboff, dst->extrefsymoff, dst->indirectsymoff);
             DEBUG("                 extreloff = %08x, locreloff = %08x",
                     dst->extreloff, dst->locreloff);
+
+            /* Fix up the indirect symbol offset */
+            if (0 != dst->indirectsymoff) {
+                off_t file_off = 0;
+                if (0 > _append_to_file(fd, cache + dst->indirectsymoff, dst->nindirectsyms * sizeof(uint32_t), &file_off)) {
+                    fprintf(stderr, "Failed to write out indirect symbol table, aborting.\n");
+                    goto done;
+                }
+                dst->indirectsymoff = file_off;
+            }
         } else if ((cmd->cmd & 0xff) == LC_DYLD_INFO) {
             struct dyld_info_command *dyl = (struct dyld_info_command *)cmd;
 
@@ -135,13 +213,27 @@ int _fixup_macho_object64(int fd, const void *cache, size_t cache_len, void *mac
                     dyl->rebase_off, dyl->bind_off, dyl->weak_bind_off, dyl->lazy_bind_off, dyl->export_off);
         } else if (cmd->cmd == LC_FUNCTION_STARTS || cmd->cmd == LC_DATA_IN_CODE) {
             struct linkedit_data_command *dcmd = (struct linkedit_data_command *)cmd;
+            off_t file_off = 0;
+
             DEBUG("    LinkEdit Data (%02x): dataoff = %08x datasize = %u", cmd->cmd, dcmd->dataoff, dcmd->datasize);
-            dcmd->dataoff = dcmd->dataoff - linkedit_file_base + linkedit->fileoff;
+
+            if (0 > _append_to_file(fd, cache + dcmd->dataoff, dcmd->datasize, &file_off)) {
+                fprintf(stderr, "Failed to append __LINKEDIT data to file, aborting.");
+            }
+            dcmd->dataoff = file_off;
         }
 
         next_cmd += cmd->cmdsize;
         cmd = macho_hdr + sizeof(struct mach_header_64) + next_cmd;
     }
+
+    if (0 > (linkedit_end = lseek(fd, 0, SEEK_END))) {
+        fprintf(stderr, "Failed to seek to end of file, aborting.\n");
+        goto done;
+    }
+
+    /* Update the __LINKEDIT segment size */
+    linkedit->filesize = linkedit_end - linkedit->fileoff;
 
     /* Now write out the updated header */
     if (0 > lseek(fd, 0, SEEK_SET)) {
@@ -402,6 +494,11 @@ done:
     if (NULL != _extract_image) {
         free(_extract_image);
         _extract_image = NULL;
+    }
+
+    if (NULL != _output_extract_image_file) {
+        free(_output_extract_image_file);
+        _output_extract_image_file = NULL;
     }
 
     if (NULL != _filename) {
