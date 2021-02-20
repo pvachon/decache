@@ -66,14 +66,14 @@ void _usage(const char *exename)
 }
 
 static
-void _dump_dir(struct dyld_cache_header *hdr, const void *cache, size_t cache_len)
+void _dump_dir(struct dyld_cache_header *hdr, const void *cache)
 {
     const struct dyld_cache_image_info *info = cache + hdr->imagesOffset;
 
     printf("Directory of Images contains %u images\n", hdr->imagesCount);
 
     for (size_t i = 0; i < hdr->imagesCount; i++) {
-        printf(" 0x%016lx  %8lu %s\n", info[i].address, (unsigned long)0, (const char *)cache + info[i].pathFileOffset);
+        printf(" 0x%016llx  %8lu %s\n", info[i].address, (unsigned long)0, (const char *)cache + info[i].pathFileOffset);
     }
 }
 
@@ -102,15 +102,14 @@ done:
  * Perform fixups on the Mach-O object to rebase to 0 (for the new file we're writing out)
  */
 static
-int _fixup_macho_object64(int fd, const void *cache, size_t cache_len, void *macho_hdr, size_t macho_hdr_len, uint64_t base_addr)
+int _fixup_macho_object64(int fd, const void *cache, void *macho_hdr, size_t macho_hdr_len)
 {
     int ret = -1;
     struct mach_header_64 *hdr = macho_hdr;
     struct load_command *cmd = macho_hdr + sizeof(struct mach_header_64); /* First load command */
     struct segment_command_64 *linkedit = NULL;
     size_t next_cmd = 0,
-           file_base = 0,
-           linkedit_file_base = 0;
+           file_base = 0;
     off_t linkedit_end = 0;
 
     /* Prepare fixups for the header */
@@ -124,7 +123,7 @@ int _fixup_macho_object64(int fd, const void *cache, size_t cache_len, void *mac
             off_t file_off = -1;
             struct section_64 *sections = (struct section_64 *)((uint8_t *)seg + sizeof(struct segment_command_64));
 
-            DEBUG("    LC_SEGMENT_64: fileoff = 0x%016lx filesize = %lu nsects = %u [%s]",
+            DEBUG("    LC_SEGMENT_64: fileoff = 0x%016llx filesize = %llu nsects = %u [%s]",
                     seg->fileoff, seg->filesize, seg->nsects, seg->segname);
 
             if (!strncmp(seg->segname, SEG_LINKEDIT, 10)) {
@@ -140,7 +139,7 @@ int _fixup_macho_object64(int fd, const void *cache, size_t cache_len, void *mac
             }
 
             for (size_t i = 0; i < seg->nsects; i++) {
-                DEBUG("        [%zu] - 0x%016lx %zu -> %u in file (%08x, reloff %08x) [%s]",
+                DEBUG("        [%zu] - 0x%016llx %llu -> %u in file (%08x, reloff %08x) [%s]",
                         i, sections[i].addr, sections[i].size, sections[i].offset, sections[i].offset,
                         sections[i].reloff, sections[i].sectname);
 
@@ -154,7 +153,7 @@ int _fixup_macho_object64(int fd, const void *cache, size_t cache_len, void *mac
             }
 
             if (0 > write(fd, cache + cache_off, seg->filesize)) {
-                fprintf(stderr, "Failed to write %lu bytes to the output file, aborting.\n", seg->filesize);
+                fprintf(stderr, "Failed to write %llu bytes to the output file, aborting.\n", seg->filesize);
                 goto done;
             }
 
@@ -191,7 +190,7 @@ int _fixup_macho_object64(int fd, const void *cache, size_t cache_len, void *mac
                 const char *str = &strtab[sym[i].n_un.n_strx];
                 size_t str_len = strlen(str) + 1;
 
-                DEBUG("Symbol: 0x%016lx [%s] (%zu bytes)", sym[i].n_value, str, str_len);
+                DEBUG("Symbol: 0x%016llx [%s] (%zu bytes)", sym[i].n_value, str, str_len);
 
                 if (0 > _append_to_file(fd, str, str_len, &file_off)) {
                     fprintf(stderr, "Failed to append symbol table string table, aborting.\n");
@@ -303,7 +302,7 @@ int _dump_file(struct dyld_cache_header *hdr, const void *cache, size_t cache_le
         }
 
         if (!strcmp(image_name, (const char *)cache + info[i].pathFileOffset)) {
-            DEBUG("Found target image offset = %016lx!", info[i].address);
+            DEBUG("Found target image offset = %016llx!", info[i].address);
             image_info = &info[i];
         }
     }
@@ -322,12 +321,12 @@ int _dump_file(struct dyld_cache_header *hdr, const void *cache, size_t cache_le
     }
 
 
-    DEBUG("Using mapping: 0x%016lx (%lu bytes, %lu offset in file)",
+    DEBUG("Using mapping: 0x%016llx (%llu bytes, %llu offset in file)",
             image_mapping->address, image_mapping->size, image_mapping->fileOffset);
 
     file_offset = image_info->address - image_mapping->address;
 
-    DEBUG("File offset is 0x%016lx", file_offset);
+    DEBUG("File offset is 0x%016llx", file_offset);
 
     magic = *(uint32_t *)(cache + file_offset);
 
@@ -364,7 +363,7 @@ int _dump_file(struct dyld_cache_header *hdr, const void *cache, size_t cache_le
         goto done;
     }
 
-    if (_fixup_macho_object64(fd, cache, cache_len, macho_obj, macho_len, image_info->address)) {
+    if (_fixup_macho_object64(fd, cache, macho_obj, macho_len)) {
         fprintf(stderr, "Failure while fixing up loader commands for Mach-O object.");
         goto done;
     }
@@ -473,7 +472,7 @@ int main(int argc, char * const *argv)
     DEBUG("  mappingCount:      0x%u", hdr.mappingCount);
     DEBUG("  imagesOffset:      0x%016x", hdr.imagesOffset);
     DEBUG("  imagesCount:       %u", hdr.imagesCount);
-    DEBUG("  dyldBaseAddress:   0x%016lx", hdr.dyldBaseAddress);
+    DEBUG("  dyldBaseAddress:   0x%016llx", hdr.dyldBaseAddress);
 
     if (0 > fstat(fd, &ss)) {
         fprintf(stderr, "Failed to stat file %s, aborting.\n", _filename);
@@ -493,13 +492,13 @@ int main(int argc, char * const *argv)
     mapping = file + hdr.mappingOffset;
     DEBUG("Mappings:");
     for (size_t i = 0; i < hdr.mappingCount; i++) {
-        DEBUG("  %02zu  %016lx %10lu bytes -> offset %016lx",
+        DEBUG("  %02zu  %016llx %10llu bytes -> offset %016llx",
                 i, mapping[i].address, mapping[i].size, mapping[i].fileOffset);
     }
 
     if (dump_dir) {
         DEBUG("Dumping the directory!");
-        _dump_dir(&hdr, file, file_len);
+        _dump_dir(&hdr, file);
     }
 
     if (NULL != _extract_image && NULL != _output_extract_image_file) {
