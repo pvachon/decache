@@ -1,17 +1,17 @@
 /*
  * Copyright (c) 2019, Phil Vachon <phil@security-embedded.com>
  * All rights reserved.
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright notice, this
  *    list of conditions and the following disclaimer.
- * 
+ *
  * 2. Redistributions in binary form must reproduce the above copyright notice,
  *    this list of conditions and the following disclaimer in the documentation
  *    and/or other materials provided with the distribution.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
  * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
@@ -233,8 +233,61 @@ int _fixup_macho_object64(int fd, const void *cache, void *macho_hdr, size_t mac
         } else if ((cmd->cmd & 0xff) == LC_DYLD_INFO) {
             struct dyld_info_command *dyl = (struct dyld_info_command *)cmd;
 
-            DEBUG("    LC_DYLD_INFO: rebase_off = %08x, bind_off = %08x, weak_bind_off = %08x, lazy_bind_off = %08x, export_off = %08x",
+            DEBUG("    LC_DYLD_INFO: BEFORE: rebase_off = %08x, bind_off = %08x, weak_bind_off = %08x, lazy_bind_off = %08x, export_off = %08x",
                     dyl->rebase_off, dyl->bind_off, dyl->weak_bind_off, dyl->lazy_bind_off, dyl->export_off);
+
+            /* Update rebase command stream offset, if any */
+            if (0 != dyl->rebase_off) {
+                off_t file_off = 0;
+                if (0 > _append_to_file(fd, cache + dyl->rebase_off, dyl->rebase_size, &file_off)) {
+                    fprintf(stderr, "Failed to write out rebase command stream, aborting.\n");
+                    goto done;
+                }
+                dyl->rebase_off = file_off;
+            }
+
+            /* Update binding table offset */
+            if (0 != dyl->bind_off) {
+                off_t file_off = 0;
+                if (0 > _append_to_file(fd, cache + dyl->bind_off, dyl->bind_size, &file_off)) {
+                    fprintf(stderr, "Failed to write out bind info, aborting.\n");
+                    goto done;
+                }
+                dyl->bind_off = file_off;
+            }
+
+            /* Update weak bind, if any */
+            if (0 != dyl->weak_bind_off) {
+                off_t file_off = 0;
+                if (0 > _append_to_file(fd, cache + dyl->weak_bind_off, dyl->weak_bind_size, &file_off)) {
+                    fprintf(stderr, "Failed to write out weak bind info, aborting.\n");
+                    goto done;
+                }
+                dyl->weak_bind_off = file_off;
+            }
+
+            /* Update lazy bind info, if any */
+            if (0 != dyl->lazy_bind_off) {
+                off_t file_off = 0;
+                if (0 > _append_to_file(fd, cache + dyl->lazy_bind_off, dyl->lazy_bind_size, &file_off)) {
+                    fprintf(stderr, "Failed to write out lazy bind info, aborting.\n");
+                    goto done;
+                }
+                dyl->lazy_bind_off = file_off;
+            }
+
+            /* Update export tables, if any */
+            if (0 != dyl->export_off) {
+                off_t file_off = 0;
+                if (0 > _append_to_file(fd, cache + dyl->export_off, dyl->export_size, &file_off)) {
+                    fprintf(stderr, "Failed to write out export info, aborting.\n");
+                    goto done;
+                }
+                dyl->export_off = file_off;
+            }
+            DEBUG("    LC_DYLD_INFO: AFTER: rebase_off = %08x, bind_off = %08x, weak_bind_off = %08x, lazy_bind_off = %08x, export_off = %08x",
+                    dyl->rebase_off, dyl->bind_off, dyl->weak_bind_off, dyl->lazy_bind_off, dyl->export_off);
+
         } else if (cmd->cmd == LC_FUNCTION_STARTS || cmd->cmd == LC_DATA_IN_CODE) {
             struct linkedit_data_command *dcmd = (struct linkedit_data_command *)cmd;
             off_t file_off = 0;
@@ -258,17 +311,6 @@ int _fixup_macho_object64(int fd, const void *cache, void *macho_hdr, size_t mac
 
     /* Update the __LINKEDIT segment size */
     linkedit->filesize = linkedit_end - linkedit->fileoff;
-
-    /* Now write out the updated header */
-    if (0 > lseek(fd, 0, SEEK_SET)) {
-        fprintf(stderr, "Failed to seek to top of file, aborting.\n");
-        goto done;
-    }
-
-    if (0 > write(fd, macho_hdr, macho_hdr_len)) {
-        fprintf(stderr, "Failed to write out Mach-O header, aborting.\n");
-        goto done;
-    }
 
     ret = 0;
 done:
@@ -320,7 +362,6 @@ int _dump_file(struct dyld_cache_header *hdr, const void *cache, size_t cache_le
         }
     }
 
-
     DEBUG("Using mapping: 0x%016llx (%llu bytes, %llu offset in file)",
             image_mapping->address, image_mapping->size, image_mapping->fileOffset);
 
@@ -365,6 +406,13 @@ int _dump_file(struct dyld_cache_header *hdr, const void *cache, size_t cache_le
 
     if (_fixup_macho_object64(fd, cache, macho_obj, macho_len)) {
         fprintf(stderr, "Failure while fixing up loader commands for Mach-O object.");
+        goto done;
+    }
+
+    /* Now write out the updated header */
+    DEBUG("Writing Updated header of length %zu", macho_len);
+    if (0 > lseek(fd, 0, SEEK_SET)) {
+        fprintf(stderr, "Failed to seek in output file (reason: %s)\n", strerror(errno));
         goto done;
     }
 
